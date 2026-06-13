@@ -1,0 +1,703 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Cascadia Motion Inverter - CAN Torque Control
+  *
+  * TARGET HARDWARE : STM32F767ZI (Nucleo-144)
+  * INVERTER        : Cascadia Motion PM/RM/CM (CAN Protocol Rev 6.2)
+  *
+  * WIRING SUMMARY
+  * --------------
+  *  ADC1 / PA0  → Accelerator sensor 1  (0.5 V idle → 3.0 V WOT)
+  *  ADC2 / PA1  → Accelerator sensor 2  (0.25 V idle → 1.5 V WOT)
+  *  ADC3 / PA2  → Brake pressure sensor (0.5 V released → 4.5 V full)
+  *  CAN1_TX / PD1, CAN1_RX / PD0  → Inverter CAN A
+  *  PC1         → GPIO output 1  (transistor / relay driver)
+  *  PC2         → GPIO output 2
+  *  PC3         → GPIO output 3
+  *
+  * CAN SETTINGS (must match inverter EEPROM)
+  * ------------------------------------------
+  *  Baud rate  : 500 kbps
+  *  Mode       : CAN Mode  (Inv_Cmd_Mode_EEPROM = 0)
+  *  Run mode   : Torque    (Run_Mode_EEPROM = 0)
+  *  CAN ID offset (default) : 0x0A0
+  *    → Command message TX  : 0x0C0
+  *    → Broadcast RX        : 0x0A0 … 0x0AF
+  *
+  * SAFETY LOGIC
+  * ------------
+  *  1. APPS plausibility : |APPS1 − APPS2| > 10 % → both zeroed (torque = 0)
+  *  2. Brake override    : brake > 20 % → torque = 0  (even if pedal pressed)
+  *  3. Inverter enable lockout : send one DISABLE frame before the first
+  *     ENABLE frame (required by Cascadia protocol section 2.2.1).
+  *  4. CAN heartbeat every 10 ms (inverter default timeout ≈ 999 ms).
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <string.h>
+#include <stdbool.h>
+
+/* USER CODE BEGIN Includes */
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* ── ADC calibration ── */
+#define ADC_REF          3.3f
+#define ADC_MAX          4095.0f
+
+/* ── Accelerator sensor voltage limits ── */
+#define APPS1_V_MIN      0.5f    /* idle voltage sensor 1 */
+#define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 */
+#define APPS2_V_MIN      0.25f   /* idle voltage sensor 2 */
+#define APPS2_V_MAX      1.5f    /* WOT  voltage sensor 2 */
+
+/* ── Brake sensor voltage limits ── */
+#define BRK_V_MIN        0.5f    /* released */
+#define BRK_V_MAX        4.5f    /* fully pressed */
+
+/* ── Safety thresholds ── */
+#define APPS_MISMATCH_THRESHOLD   0.10f   /* 10 % */
+#define BRAKE_OVERRIDE_THRESHOLD  0.20f   /* 20 % */
+
+/* ── CAN IDs (default offset 0x0A0) ── */
+#define CAN_ID_CMD       0x0C0   /* command message  → inverter */
+#define CAN_ID_STATUS    0x0AA   /* internal states ← inverter (optional RX) */
+
+/* ── Torque scaling ── */
+/*   Protocol: torque value = actual_Nm × 10, signed 16-bit, little-endian.
+ *   Set MAX_TORQUE_NM to your motor's rated motoring torque.             */
+#define MAX_TORQUE_NM    200.0f  /* ← adjust to your motor */
+
+/* ── Loop period ── */
+#define LOOP_PERIOD_MS   10u
+
+/* ── GPIO output pins (already configured as outputs in MX_GPIO_Init) ── */
+#define GPIO_OUT1_PORT   GPIOC
+#define GPIO_OUT1_PIN    GPIO_PIN_1
+
+#define GPIO_OUT2_PORT   GPIOC
+#define GPIO_OUT2_PIN    GPIO_PIN_2
+
+#define GPIO_OUT3_PORT   GPIOC
+#define GPIO_OUT3_PIN    GPIO_PIN_3
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
+ADC_HandleTypeDef hadc3;
+
+CAN_HandleTypeDef hcan1;
+
+UART_HandleTypeDef huart3;
+
+PCD_HandleTypeDef hpcd_USB_OTG_FS;
+
+/* USER CODE BEGIN PV */
+
+/* ── Raw ADC readings ── */
+static uint32_t adc_apps1 = 0;
+static uint32_t adc_apps2 = 0;
+static uint32_t adc_brake = 0;
+
+/* ── Normalised pedal positions [0.0 … 1.0] ── */
+static float apps1_norm = 0.0f;
+static float apps2_norm = 0.0f;
+static float brake_norm = 0.0f;
+
+/* ── CAN RX scratch buffer ── */
+static uint8_t can_rx_data[8];
+
+/* ── Inverter enable lockout flag ──
+ *   Must send one DISABLE before the first ENABLE (section 2.2.1).       */
+static bool lockout_cleared = false;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USB_OTG_FS_PCD_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
+static void MX_ADC3_Init(void);
+static void MX_CAN1_Init(void);
+
+/* USER CODE BEGIN PFP */
+static void     Read_ADC_Values(void);
+static void     Process_Pedals(void);
+static void     CAN_SendCommand(float torque_norm, bool enable_inverter);
+static float    Clampf(float v, float lo, float hi);
+
+/* ── User GPIO helpers – call these anywhere in the while(1) ── */
+static void GPIO_Out1_Set(GPIO_PinState state);
+static void GPIO_Out2_Set(GPIO_PinState state);
+static void GPIO_Out3_Set(GPIO_PinState state);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/**
+ * @brief  Clamp a float to [lo, hi].
+ */
+static float Clampf(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/**
+ * @brief  Drive GPIO output 1 (PC1).
+ *         Example: GPIO_Out1_Set(GPIO_PIN_SET);   // transistor ON
+ *                  GPIO_Out1_Set(GPIO_PIN_RESET);  // transistor OFF
+ */
+static void GPIO_Out1_Set(GPIO_PinState state)
+{
+    HAL_GPIO_WritePin(GPIO_OUT1_PORT, GPIO_OUT1_PIN, state);
+}
+
+/**
+ * @brief  Drive GPIO output 2 (PC2).
+ */
+static void GPIO_Out2_Set(GPIO_PinState state)
+{
+    HAL_GPIO_WritePin(GPIO_OUT2_PORT, GPIO_OUT2_PIN, state);
+}
+
+/**
+ * @brief  Drive GPIO output 3 (PC3).
+ */
+static void GPIO_Out3_Set(GPIO_PinState state)
+{
+    HAL_GPIO_WritePin(GPIO_OUT3_PORT, GPIO_OUT3_PIN, state);
+}
+
+/**
+ * @brief  Read all three ADC channels sequentially.
+ */
+static void Read_ADC_Values(void)
+{
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    adc_apps1 = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
+    HAL_ADC_Start(&hadc2);
+    HAL_ADC_PollForConversion(&hadc2, HAL_MAX_DELAY);
+    adc_apps2 = HAL_ADC_GetValue(&hadc2);
+    HAL_ADC_Stop(&hadc2);
+
+    HAL_ADC_Start(&hadc3);
+    HAL_ADC_PollForConversion(&hadc3, HAL_MAX_DELAY);
+    adc_brake = HAL_ADC_GetValue(&hadc3);
+    HAL_ADC_Stop(&hadc3);
+}
+
+/**
+ * @brief  Convert ADC counts → normalised pedal positions.
+ *
+ *         APPS1 : 0.5 V (idle)  →  3.0 V (WOT)
+ *         APPS2 : 0.25 V (idle) →  1.5 V (WOT)
+ *         BRAKE : 0.5 V (off)   →  4.5 V (full)
+ *
+ *         All results are clamped to [0.0, 1.0].
+ */
+static void Process_Pedals(void)
+{
+    float v1 = (adc_apps1 * ADC_REF) / ADC_MAX;
+    float v2 = (adc_apps2 * ADC_REF) / ADC_MAX;
+    float vb = (adc_brake  * ADC_REF) / ADC_MAX;
+
+    apps1_norm = (v1 - APPS1_V_MIN) / (APPS1_V_MAX - APPS1_V_MIN);
+    apps2_norm = (v2 - APPS2_V_MIN) / (APPS2_V_MAX - APPS2_V_MIN);
+    brake_norm = (vb - BRK_V_MIN)   / (BRK_V_MAX   - BRK_V_MIN);
+
+    apps1_norm = Clampf(apps1_norm, 0.0f, 1.0f);
+    apps2_norm = Clampf(apps2_norm, 0.0f, 1.0f);
+    brake_norm = Clampf(brake_norm, 0.0f, 1.0f);
+}
+
+/**
+ * @brief  Build and transmit a Cascadia Motion Command Message (0x0C0).
+ *
+ *  Frame layout (CAN Protocol Rev 6.2, section 1.4 / 2.2, little-endian):
+ *  ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+ *  │ Byte 0  │ Byte 1  │ Byte 2  │ Byte 3  │ Byte 4  │ Byte 5  │ Byte 6  │ Byte 7  │
+ *  │  Torque Command (×10, signed 16-bit LE) │ Speed Cmd (16-bit LE)    │ Dir     │
+ *  ├─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+ *  │ Inv Ena │ Reserved │       Torque Limit (16-bit LE, 0 = use EEPROM)           │
+ *  └─────────┴──────────┴─────────────────────────────────────────────────────────┘
+ *
+ *  Byte 4 : Direction  0 = Reverse,  1 = Forward
+ *  Byte 5 : Bit 0 = Inverter Enable,  Bit 1 = Discharge,  Bit 2 = Speed Mode
+ *           Bits 4-7 = Rolling Counter (unused here → 0)
+ *  Bytes 6-7 : Commanded Torque Limit = 0  (use EEPROM defaults)
+ *
+ * @param  torque_norm   Requested torque [0.0 … 1.0]
+ * @param  enable_inverter  true = enable, false = disable
+ */
+static void CAN_SendCommand(float torque_norm, bool enable_inverter)
+{
+    static CAN_TxHeaderTypeDef hdr = {
+        .StdId              = CAN_ID_CMD,
+        .IDE                = CAN_ID_STD,
+        .RTR                = CAN_RTR_DATA,
+        .DLC                = 8,
+        .TransmitGlobalTime = DISABLE,
+    };
+
+    uint32_t mailbox;
+    uint8_t  data[8] = {0};
+
+    /* ── Torque command : actual_Nm × 10, signed 16-bit, little-endian ── */
+    float    actual_Nm   = torque_norm * MAX_TORQUE_NM;
+    int16_t  torque_raw  = (int16_t)(actual_Nm * 10.0f);
+    data[0] = (uint8_t)( torque_raw        & 0xFF);   /* low  byte */
+    data[1] = (uint8_t)((torque_raw >> 8)  & 0xFF);   /* high byte */
+
+    /* ── Speed command : 0 in torque mode (don't care) ── */
+    data[2] = 0x00;
+    data[3] = 0x00;
+
+    /* ── Direction : Forward = 1 ── */
+    data[4] = 0x01;
+
+    /* ── Inverter enable (bit 0), discharge off (bit 1 = 0) ── */
+    data[5] = enable_inverter ? 0x01 : 0x00;
+
+    /* ── Commanded Torque Limit = 0 → use EEPROM defaults ── */
+    data[6] = 0x00;
+    data[7] = 0x00;
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, data, &mailbox);
+    }
+}
+
+/* USER CODE END 0 */
+
+/* ============================================================
+ *  APPLICATION ENTRY POINT
+ * ============================================================ */
+int main(void)
+{
+    /* USER CODE BEGIN 1 */
+    CAN_FilterTypeDef sFilterConfig;
+    /* USER CODE END 1 */
+
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_USART3_UART_Init();
+    MX_USB_OTG_FS_PCD_Init();
+    MX_ADC1_Init();
+    MX_ADC2_Init();
+    MX_ADC3_Init();
+    MX_CAN1_Init();
+
+    /* USER CODE BEGIN 2 */
+
+    /* ── Enable auto-retransmission (important for reliability) ── */
+    hcan1.Init.AutoRetransmission = ENABLE;
+
+    /* ── CAN filter : accept ALL messages ── */
+    sFilterConfig.FilterBank           = 0;
+    sFilterConfig.FilterMode           = CAN_FILTERMODE_IDMASK;
+    sFilterConfig.FilterScale          = CAN_FILTERSCALE_32BIT;
+    sFilterConfig.FilterIdHigh         = 0x0000;
+    sFilterConfig.FilterIdLow          = 0x0000;
+    sFilterConfig.FilterMaskIdHigh     = 0x0000;
+    sFilterConfig.FilterMaskIdLow      = 0x0000;
+    sFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    sFilterConfig.FilterActivation     = ENABLE;
+    sFilterConfig.SlaveStartFilterBank = 14;
+    HAL_CAN_ConfigFilter(&hcan1, &sFilterConfig);
+
+    HAL_CAN_Start(&hcan1);
+    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+    /* ── Step 1 : Clear inverter enable lockout ──────────────────────────
+     *   Per section 2.2.1 the inverter ignores the first ENABLE command
+     *   unless it has already received at least one DISABLE command.
+     *   Send a few DISABLE frames before entering the main loop.
+     *   The inverter processes commands every 3 ms; 5 × 10 ms is plenty. */
+    for (int i = 0; i < 5; i++)
+    {
+        CAN_SendCommand(0.0f, false);   /* DISABLE → clears lockout */
+        HAL_Delay(10);
+    }
+    lockout_cleared = true;
+
+    /* ── All three GPIO outputs start LOW (transistors OFF) ── */
+    GPIO_Out1_Set(GPIO_PIN_RESET);
+    GPIO_Out2_Set(GPIO_PIN_RESET);
+    GPIO_Out3_Set(GPIO_PIN_RESET);
+
+    /* USER CODE END 2 */
+
+    /* ================================================================
+     *  MAIN LOOP  (10 ms period → 100 Hz CAN heartbeat)
+     * ================================================================ */
+    while (1)
+    {
+        /* USER CODE BEGIN WHILE */
+
+        /* ── 1. Read ADC ── */
+        Read_ADC_Values();
+
+        /* ── 2. Convert to normalised pedal positions ── */
+        Process_Pedals();
+
+        /* ── 3. APPS plausibility check (10 % mismatch limit) ──────────
+         *   If the two accelerator sensors disagree by more than 10 %
+         *   the ECU must zero both channels.  This detects sensor
+         *   failure or wiring faults per automotive APPS safety rules.  */
+        float apps_diff = apps1_norm - apps2_norm;
+        if (apps_diff < 0.0f) apps_diff = -apps_diff;
+
+        if (apps_diff > APPS_MISMATCH_THRESHOLD)
+        {
+            apps1_norm = 0.0f;
+            apps2_norm = 0.0f;
+        }
+
+        /* ── 4. Compute final torque demand ── */
+        float torque_demand = (apps1_norm + apps2_norm) * 0.5f;
+
+        /* ── 5. Brake override ──────────────────────────────────────────
+         *   If brake pressure exceeds 20 % the torque command is forced
+         *   to zero regardless of accelerator position.  This prevents
+         *   simultaneous acceleration and braking (APPS+brake check).  */
+        bool brake_active = (brake_norm > BRAKE_OVERRIDE_THRESHOLD);
+        if (brake_active)
+        {
+            torque_demand = 0.0f;
+        }
+
+        /* ── 6. Send CAN Command Message ── */
+        /*   Inverter is enabled as long as the lockout has been cleared.
+         *   You can add your own logic here (e.g. a start button) to
+         *   decide when to actually enable the inverter.              */
+        bool inverter_enable = lockout_cleared;   /* ← adjust as needed */
+        CAN_SendCommand(torque_demand, inverter_enable);
+
+        /* ================================================================
+         *  GPIO OUTPUT EXAMPLES
+         *  ---------------------
+         *  Put your own conditions below.  The three GPIOs drive NPN
+         *  transistors or optocouplers externally.  Replace the sample
+         *  conditions with whatever logic your application requires.
+         * ================================================================ */
+
+        /* ── GPIO 1 : turn ON when accelerator is pressed > 5 % ── */
+        if (torque_demand > 0.05f)
+        {
+            GPIO_Out1_Set(GPIO_PIN_SET);    /* transistor ON */
+        }
+        else
+        {
+            GPIO_Out1_Set(GPIO_PIN_RESET);  /* transistor OFF */
+        }
+
+        /* ── GPIO 2 : turn ON when brake is actively pressed ── */
+        if (brake_active)
+        {
+            GPIO_Out2_Set(GPIO_PIN_SET);
+        }
+        else
+        {
+            GPIO_Out2_Set(GPIO_PIN_RESET);
+        }
+
+        /* ── GPIO 3 : turn ON when APPS mismatch fault is present ── */
+        if (apps_diff > APPS_MISMATCH_THRESHOLD)
+        {
+            GPIO_Out3_Set(GPIO_PIN_SET);    /* fault indicator */
+        }
+        else
+        {
+            GPIO_Out3_Set(GPIO_PIN_RESET);
+        }
+
+        /* ── Loop delay : 10 ms → 100 Hz heartbeat ── */
+        HAL_Delay(LOOP_PERIOD_MS);
+
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+        /* USER CODE END 3 */
+    }
+}
+
+/* ============================================================
+ *  CAN RX INTERRUPT CALLBACK
+ *  Reads the pending frame from FIFO 0.
+ *  Add your own handling here if you need to react to
+ *  broadcast messages (fault codes, temperatures, etc.).
+ * ============================================================ */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef rx_hdr;
+    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_hdr, can_rx_data);
+
+    /* Optional: parse status / fault messages here.
+     * Example – Fault Codes frame (0x0AB):
+     *
+     * if (rx_hdr.StdId == 0x0AB)
+     * {
+     *     uint32_t run_fault_lo = (can_rx_data[5] << 8) | can_rx_data[4];
+     *     // bit 11 of run_fault_lo → CAN Command Lost fault
+     * }
+     */
+}
+
+/* ============================================================
+ *  PERIPHERAL INITIALISATION  (generated by STM32CubeMX)
+ * ============================================================ */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_BYPASS;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 4;
+    RCC_OscInitStruct.PLL.PLLN       = 168;
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ       = 7;
+    RCC_OscInitStruct.PLL.PLLR       = 2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    hadc1.Instance                   = ADC1;
+    hadc1.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode          = DISABLE;
+    hadc1.Init.ContinuousConvMode    = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion       = 1;
+    hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+
+    sConfig.Channel      = ADC_CHANNEL_0;
+    sConfig.Rank         = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC2_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    hadc2.Instance                   = ADC2;
+    hadc2.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc2.Init.Resolution            = ADC_RESOLUTION_12B;
+    hadc2.Init.ScanConvMode          = DISABLE;
+    hadc2.Init.ContinuousConvMode    = DISABLE;
+    hadc2.Init.DiscontinuousConvMode = DISABLE;
+    hadc2.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc2.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    hadc2.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
+    hadc2.Init.NbrOfConversion       = 1;
+    hadc2.Init.DMAContinuousRequests = DISABLE;
+    hadc2.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc2) != HAL_OK) Error_Handler();
+
+    sConfig.Channel      = ADC_CHANNEL_1;
+    sConfig.Rank         = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC3_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    hadc3.Instance                   = ADC3;
+    hadc3.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc3.Init.Resolution            = ADC_RESOLUTION_12B;
+    hadc3.Init.ScanConvMode          = DISABLE;
+    hadc3.Init.ContinuousConvMode    = DISABLE;
+    hadc3.Init.DiscontinuousConvMode = DISABLE;
+    hadc3.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc3.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    hadc3.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
+    hadc3.Init.NbrOfConversion       = 1;
+    hadc3.Init.DMAContinuousRequests = DISABLE;
+    hadc3.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc3) != HAL_OK) Error_Handler();
+
+    sConfig.Channel      = ADC_CHANNEL_2;
+    sConfig.Rank         = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc3, &sConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_CAN1_Init(void)
+{
+    /*  500 kbps on PCLK1 = 42 MHz
+     *  Prescaler = 4 → time quantum = 1/(42 MHz / 4) = ~95.24 ns
+     *  Total TQ per bit = 1 + BS1 + BS2 = 1 + 13 + 7 = 21 TQ
+     *  Bit rate = 42 MHz / 4 / 21 = 500 000 bps  ✓                    */
+    hcan1.Instance          = CAN1;
+    hcan1.Init.Prescaler    = 4;
+    hcan1.Init.Mode         = CAN_MODE_NORMAL;
+    hcan1.Init.SyncJumpWidth= CAN_SJW_1TQ;
+    hcan1.Init.TimeSeg1     = CAN_BS1_13TQ;
+    hcan1.Init.TimeSeg2     = CAN_BS2_7TQ;
+    hcan1.Init.TimeTriggeredMode   = DISABLE;
+    hcan1.Init.AutoBusOff          = DISABLE;
+    hcan1.Init.AutoWakeUp          = DISABLE;
+    hcan1.Init.AutoRetransmission  = ENABLE;   /* set again after init */
+    hcan1.Init.ReceiveFifoLocked   = DISABLE;
+    hcan1.Init.TransmitFifoPriority= DISABLE;
+    if (HAL_CAN_Init(&hcan1) != HAL_OK) Error_Handler();
+}
+
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance          = USART3;
+    huart3.Init.BaudRate     = 115200;
+    huart3.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits     = UART_STOPBITS_1;
+    huart3.Init.Parity       = UART_PARITY_NONE;
+    huart3.Init.Mode         = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler();
+}
+
+static void MX_USB_OTG_FS_PCD_Init(void)
+{
+    hpcd_USB_OTG_FS.Instance                = USB_OTG_FS;
+    hpcd_USB_OTG_FS.Init.dev_endpoints      = 6;
+    hpcd_USB_OTG_FS.Init.speed              = PCD_SPEED_FULL;
+    hpcd_USB_OTG_FS.Init.dma_enable         = DISABLE;
+    hpcd_USB_OTG_FS.Init.phy_itface         = PCD_PHY_EMBEDDED;
+    hpcd_USB_OTG_FS.Init.Sof_enable         = ENABLE;
+    hpcd_USB_OTG_FS.Init.low_power_enable   = DISABLE;
+    hpcd_USB_OTG_FS.Init.lpm_enable         = DISABLE;
+    hpcd_USB_OTG_FS.Init.vbus_sensing_enable= ENABLE;
+    hpcd_USB_OTG_FS.Init.use_dedicated_ep1  = DISABLE;
+    if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOG_CLK_ENABLE();
+
+    /* Start all outputs LOW */
+    HAL_GPIO_WritePin(GPIOC,
+        GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_7 | GPIO_PIN_9,
+        GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, LD1_Pin | LD3_Pin | LD2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
+
+    /* User button */
+    GPIO_InitStruct.Pin  = USER_Btn_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+
+    /* GPIO outputs : PC1(Out1), PC2(Out2), PC3(Out3), PC7, PC9 */
+    GPIO_InitStruct.Pin   = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3
+                          | GPIO_PIN_7 | GPIO_PIN_9;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /* LEDs */
+    GPIO_InitStruct.Pin   = LD1_Pin | LD3_Pin | LD2_Pin;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* USB power switch */
+    GPIO_InitStruct.Pin   = USB_PowerSwitchOn_Pin;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+    /* USB over-current detect (input) */
+    GPIO_InitStruct.Pin  = USB_OverCurrent_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+    /* PC6, PC8 inputs */
+    GPIO_InitStruct.Pin  = GPIO_PIN_6 | GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) { /* hang */ }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    (void)file; (void)line;
+}
+#endif /* USE_FULL_ASSERT */
