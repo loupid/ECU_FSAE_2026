@@ -48,6 +48,18 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum
+{
+	DIR_FORWARD = 0, ///< Counter-clockwise motor rotation
+	DIR_REVERSE = 1  ///< Clockwise motor rotation
+} dir_t;
+
+typedef struct
+{
+    uint32_t id;
+    uint8_t data[8];
+} can_msg_rx_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -103,10 +115,52 @@
 #define GPIO_OUT3_PORT   GPIOC
 #define GPIO_OUT3_PIN    GPIO_PIN_3
 
+// TODO : put in config file
+#define DRIVE_TEMPERATURES_1_CAN_ID (0x0A0)
+#define DRIVE_TEMPERATURES_2_CAN_ID (0x0A1)
+#define DRIVE_TEMPERATURES_3_CAN_ID (0x0A2)
+#define DRIVE_ANALOG_IN_VOLTAGES_CAN_ID (0x0A3)
+#define DRIVE_DIGITAL_IN_STATUS_CAN_ID (0x0A4)
+#define DRIVE_MOTOR_POS_INFO_CAN_ID (0x0A5)
+#define DRIVE_CURRENT_INFO_CAN_ID (0x0A6)
+#define DRIVE_VOLTAGE_INFO_CAN_ID (0x0A7)
+#define DRIVE_FLUX_INFO_CAN_ID (0x0A8)
+#define DRIVE_INTERNAL_VOLTAGES_CAN_ID (0x0A9)
+#define DRIVE_INTERNAL_STATE_CAN_ID_CAN_ID (0x0AA)
+#define DRIVE_FAULT_CODES_CAN_ID (0x0AB)
+#define DRIVE_TORQUE_AND_TIMER_INFO_CAN_ID (0x0AC)
+#define DRIVE_MODULATION_INDEX_AND_FLUX_WEAKENING_OUT_INFO_CAN_ID (0x0AD)
+#define DRIVE_FIRMWARE_INFO_CAN_ID (0x0AE)
+#define DRIVE_DIAGNOSTIC_DATA_CAN_ID (0x0AF)
+#define DRIVE_HIGH_SPEED_MSG_CAN_ID (0x0B0)
+#define DRIVE_CMD_CAN_ID        (0x0C0)
+#define DRIVE_PARAM_CMD_CAN_ID  (0x0C1)
+#define DRIVE_PARAM_RESP_CAN_ID (0x0C2)
+
+#define DRIVE_CAN_DLC (8)
+
+#define READ  (0)
+#define WRITE (1)
+#define RESERVED_BYTE (0)
+
+#define BYTE_MASK (0xFF)
+#define HIGH_BYTE_OFFSET (8)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define TORQUE_MAX (100) // Nm * 10
+//#define ADC_MIN (0x000)
+//#define ADC_MAX (0xFFF)
+#define PEDAL_MIN ((ADC_MAX * 3) / 25) // (12% of ADC_MAX. Theorical min is 9,9 (Â±2) % of ADC_MAX.)
+#define PEDAL_MAX ((ADC_MAX * 57) / 100) // (57% of ADC_MAX. Theorical min is 59,4 (Â±2) % of ADC_MAX.)
+#define SPEED_MAX (4000) // RPM
+
+#define GET_LOW_BYTE(__word__) ((__word__) & BYTE_MASK)
+#define GET_HIGH_BYTE(__word__) (((__word__) >> HIGH_BYTE_OFFSET) & BYTE_MASK)
+#define GET_WORD(__low_byte__, __high_byte__) ((__low_byte__) | ((__high_byte__) << HIGH_BYTE_OFFSET))
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -132,12 +186,11 @@ static float apps1_norm = 0.0f;
 static float apps2_norm = 0.0f;
 static float brake_norm = 0.0f;
 
-/* ── CAN RX scratch buffer ── */
-static uint8_t can_rx_data[8];
-
 /* ── Inverter enable lockout flag ──
  *   Must send one DISABLE before the first ENABLE (section 2.2.1).       */
 static bool lockout_cleared = false;
+
+int16_t g_speed = 0; // RPM
 
 /* USER CODE END PV */
 
@@ -156,6 +209,15 @@ static void     Read_ADC_Values(void);
 static void     Process_Pedals(void);
 static void     CAN_SendCommand(float torque_norm, bool enable_inverter);
 static float    Clampf(float v, float lo, float hi);
+
+void drive_cmd_tx (int16_t torque, int16_t speed, uint8_t dir, uint8_t inverter_enable,
+                     uint8_t inverter_discharge, uint8_t speed_mode_enable, int16_t torque_lim);
+void drive_param_write (uint16_t param_addr, uint16_t data);
+void can_byte_tx (uint8_t val);
+void can_word_tx (uint16_t word);
+void can_msg_parse (CAN_RxHeaderTypeDef* p_header, uint8_t* p_data);
+int lin_map (int val, int in_min, int in_max, int out_min, int out_max);
+int limit (int val, int min, int max);
 
 /* ── User GPIO helpers – call these anywhere in the while(1) ── */
 static void GPIO_Out1_Set(GPIO_PinState state);
@@ -415,8 +477,19 @@ int main(void)
         /*   Inverter is enabled as long as the lockout has been cleared.
          *   You can add your own logic here (e.g. a start button) to
          *   decide when to actually enable the inverter.              */
-        bool inverter_enable = lockout_cleared;   /* ← adjust as needed */
-        CAN_SendCommand(torque_demand, inverter_enable);
+        //bool inverter_enable = lockout_cleared;   /* ← adjust as needed */
+        //CAN_SendCommand(torque_demand, inverter_enable);
+
+#if 01
+		can_word_tx(g_speed); // Envoie un message contenant la vitesse actuelle
+#endif
+		uint8_t inverter_enable = torque_demand > 0 ? 1 : 0;
+		uint8_t inverter_discharge = 0;
+		uint8_t speed_mode_enable = 0;
+		int16_t torque_lim = 0;
+
+		drive_cmd_tx (torque_demand, SPEED_MAX, DIR_FORWARD, inverter_enable,
+						inverter_discharge, speed_mode_enable, torque_lim);
 
         /* ================================================================
          *  GPIO OUTPUT EXAMPLES
@@ -474,8 +547,11 @@ int main(void)
  * ============================================================ */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-    CAN_RxHeaderTypeDef rx_hdr;
-    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_hdr, can_rx_data);
+	static uint8_t data[8];
+    CAN_RxHeaderTypeDef header;
+
+    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &header, data);
+    can_msg_parse(&header, data);
 
     /* Optional: parse status / fault messages here.
      * Example – Fault Codes frame (0x0AB):
@@ -701,6 +777,187 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/**
+ * Send torque/speed command to motor drive
+ *
+ * \param torque_norm [in] Requested torque [0.0 … 1.0]. When speed mode, feedforward for speed regulator
+ * For a forward direction command:
+ * Positive torque command will give a positive torque feedback and is
+ * motoring for positive speed.
+ * Negative torque command will give a negative torque feedback and is
+ * regen for positive speed.
+ * Positive torque command will give a positive torque feedback and is regen
+ * for negative speed.
+ * A negative torque command should not be allowed if already going
+ * negative speed.
+ *
+ * \param speed [in] Speed command (RPM) when speed mode. When torque mode, it over-rides EEPROM's speed lim.
+ *
+ * \param dir [in] Rotation direction. 1 = forward (anti-horaire), 0 = reverse (horaire)
+ *                 Disable inverter before changing this parameter and re-enable after.
+ *
+ * \param inverter_enable [in] 0 = Inverter Off, 1 = Inverter On
+ *                             An initial 0 must be sent before a 1 can actually enable the inverter
+ *
+ * \param inverter_discharge [in] 0 = Disable Discharge, 1 = Enable Discharge
+ *
+ * \param speed_mode_enable [in] 0 = Do not over-ride mode,
+ *                               1 = If controller is in torque mode then controller will change to speed mode.
+ *
+ * \param torque_lim [in] Motor and Regen max torque. 0 = keep default limits in EEPROM.
+ */
+void drive_cmd_tx (int16_t torque_norm, int16_t speed, uint8_t dir, uint8_t inverter_enable,
+                     uint8_t inverter_discharge, uint8_t speed_mode_enable, int16_t torque_lim)
+{
+	static CAN_TxHeaderTypeDef hdr = {
+        .StdId              = CAN_ID_CMD,
+        .IDE                = CAN_ID_STD,
+        .RTR                = CAN_RTR_DATA,
+        .DLC                = 8,
+        .TransmitGlobalTime = DISABLE,
+    };
+
+    uint32_t mailbox;
+    uint8_t ctrl_bits = inverter_enable | (inverter_discharge << 1) | (speed_mode_enable << 2);
+
+    /* ── Torque command : actual_Nm × 10, signed 16-bit, little-endian ── */
+    float    actual_Nm   = torque_norm * MAX_TORQUE_NM;
+    int16_t  torque_raw  = (int16_t)(actual_Nm * 10.0f);
+
+    static uint8_t cmd[8];
+
+	cmd[0] = GET_LOW_BYTE(torque_raw);
+	cmd[1] = GET_HIGH_BYTE(torque_raw);
+	cmd[2] = GET_LOW_BYTE(speed);
+	cmd[3] = GET_HIGH_BYTE(speed);
+	cmd[4] = dir;
+	cmd[5] = ctrl_bits;
+	cmd[6] = GET_LOW_BYTE(torque_lim);
+	cmd[7] = GET_HIGH_BYTE(torque_lim);
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, cmd, &mailbox);
+    }
+}
+
+void drive_param_write (uint16_t param_addr, uint16_t data)
+{
+	static CAN_TxHeaderTypeDef hdr = {
+        .StdId              = CAN_ID_CMD,
+        .IDE                = CAN_ID_STD,
+        .RTR                = CAN_RTR_DATA,
+        .DLC                = 8,
+        .TransmitGlobalTime = DISABLE,
+    };
+
+    uint32_t mailbox;
+
+    static uint8_t cmd[8];
+
+    cmd[0] = GET_LOW_BYTE(param_addr);
+    cmd[1] = GET_HIGH_BYTE(param_addr);
+    cmd[2] = WRITE; // Read|Write
+    cmd[3] = RESERVED_BYTE;
+    cmd[4] = GET_LOW_BYTE(data);
+    cmd[5] = GET_HIGH_BYTE(data);
+    cmd[6] = RESERVED_BYTE;
+    cmd[7] = RESERVED_BYTE;
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, cmd, &mailbox);
+    }
+}
+
+void can_byte_tx (uint8_t val)
+{
+	static CAN_TxHeaderTypeDef hdr = {
+		.StdId              = 0x0DB,
+		.IDE                = CAN_ID_STD,
+		.RTR                = CAN_RTR_DATA,
+		.DLC                = 1,
+		.TransmitGlobalTime = DISABLE,
+	};
+
+    uint32_t mailbox;
+
+	static uint8_t byte;
+	byte = val;
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, &byte, &mailbox);
+    }
+}
+
+void can_word_tx (uint16_t word)
+{
+	static CAN_TxHeaderTypeDef hdr = {
+		.StdId              = 0x1DB,
+		.IDE                = CAN_ID_STD,
+		.RTR                = CAN_RTR_DATA,
+		.DLC                = 2,
+		.TransmitGlobalTime = DISABLE,
+	};
+
+    uint32_t mailbox;
+	static uint8_t bytes[2];
+
+	bytes[0] = GET_LOW_BYTE(word);
+	bytes[1] = GET_HIGH_BYTE(word);
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, bytes, &mailbox);
+    }
+}
+
+void can_msg_parse (CAN_RxHeaderTypeDef* p_header, uint8_t* p_data)
+{
+	switch (p_header->StdId)
+	{
+		case DRIVE_PARAM_RESP_CAN_ID:
+			// todo: voir CAN Protocol.pdf, p.38
+			break;
+
+		case DRIVE_MOTOR_POS_INFO_CAN_ID:
+			g_speed = GET_WORD(p_data[2], p_data[3]);
+			break;
+
+		default:
+			// todo
+            break;
+	}
+}
+
+int lin_map (int val, int in_min, int in_max, int out_min, int out_max)
+{
+	val = limit(val, in_min, in_max);
+
+	int delta_in = in_max - in_min;
+	int delta_out = out_max - out_min;
+
+	return (((val - in_min) * delta_out) / delta_in) + out_min;
+}
+
+int limit (int val, int min, int max)
+{
+    if (val < min)
+    {
+        val = min;
+    }
+    else if (val > max)
+    {
+        val = max;
+    }
+
+    return val;
+}
 /* USER CODE END 4 */
 
 void Error_Handler(void)
