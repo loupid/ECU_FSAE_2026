@@ -57,11 +57,21 @@
 #define ADC_REF          3.3f
 #define ADC_MAX          4095.0f
 
+/* ── Test Mode Configuration ── */
+#define TEST_SINGLE_POTENTIOMETER  1  /* Set to 1 for bench testing with 1 pot on PA0, 0 for dual-channel APPS */
+
 /* ── Accelerator sensor voltage limits ── */
+#if TEST_SINGLE_POTENTIOMETER
+#define APPS1_V_MIN      1.7f    /* idle voltage sensor 1 (1.7 V) */
+#define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 (3.0 V) */
+#define APPS2_V_MIN      1.7f
+#define APPS2_V_MAX      3.0f
+#else
 #define APPS1_V_MIN      0.5f    /* idle voltage sensor 1 */
 #define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 */
 #define APPS2_V_MIN      0.25f   /* idle voltage sensor 2 */
 #define APPS2_V_MAX      1.5f    /* WOT  voltage sensor 2 */
+#endif
 
 /* ── Brake sensor voltage limits ── */
 #define BRK_V_MIN        0.5f    /* released */
@@ -229,7 +239,11 @@ static void Process_Pedals(void)
     float vb = (adc_brake  * ADC_REF) / ADC_MAX;
 
     apps1_norm = (v1 - APPS1_V_MIN) / (APPS1_V_MAX - APPS1_V_MIN);
+#if TEST_SINGLE_POTENTIOMETER
+    apps2_norm = apps1_norm; /* In test mode, copy APPS1 to APPS2 to prevent mismatch fault */
+#else
     apps2_norm = (v2 - APPS2_V_MIN) / (APPS2_V_MAX - APPS2_V_MIN);
+#endif
     brake_norm = (vb - BRK_V_MIN)   / (BRK_V_MAX   - BRK_V_MIN);
 
     apps1_norm = Clampf(apps1_norm, 0.0f, 1.0f);
