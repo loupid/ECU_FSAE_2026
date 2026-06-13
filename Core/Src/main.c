@@ -58,18 +58,18 @@
 #define ADC_MAX          4095.0f
 
 /* ── Test Mode Configuration ── */
-#define TEST_SINGLE_POTENTIOMETER  1  /* Set to 1 for bench testing with 1 pot on PA0, 0 for dual-channel APPS */
+#define TEST_SINGLE_POTENTIOMETER  0  /* Set to 1 for bench testing with 1 pot on PA0, 0 for dual-channel APPS */
 
 /* ── Accelerator sensor voltage limits ── */
 #if TEST_SINGLE_POTENTIOMETER
 #define APPS1_V_MIN      1.7f    /* idle voltage sensor 1 (1.7 V) */
 #define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 (3.0 V) */
-#define APPS2_V_MIN      1.7f
-#define APPS2_V_MAX      3.0f
+#define APPS2_V_MIN      0.875f
+#define APPS2_V_MAX      1.5f
 #else
-#define APPS1_V_MIN      0.5f    /* idle voltage sensor 1 */
+#define APPS1_V_MIN      1.7f    /* idle voltage sensor 1 */
 #define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 */
-#define APPS2_V_MIN      0.25f   /* idle voltage sensor 2 */
+#define APPS2_V_MIN      0.875f   /* idle voltage sensor 2 */
 #define APPS2_V_MAX      1.5f    /* WOT  voltage sensor 2 */
 #endif
 
