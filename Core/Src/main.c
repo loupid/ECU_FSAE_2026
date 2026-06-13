@@ -67,9 +67,9 @@
 #define APPS2_V_MIN      0.875f
 #define APPS2_V_MAX      1.5f
 #else
-#define APPS1_V_MIN      1.7f    /* idle voltage sensor 1 */
+#define APPS1_V_MIN      1.8f    /* idle voltage sensor 1 */
 #define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 */
-#define APPS2_V_MIN      0.875f   /* idle voltage sensor 2 */
+#define APPS2_V_MIN      0.9f   /* idle voltage sensor 2 */
 #define APPS2_V_MAX      1.5f    /* WOT  voltage sensor 2 */
 #endif
 
