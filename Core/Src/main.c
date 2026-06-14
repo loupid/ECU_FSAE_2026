@@ -65,6 +65,12 @@ typedef struct
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* ── Pins VCU custom ── */
+#define PIN_BRAKE_LIGHT_PORT GPIOC
+#define PIN_BRAKE_LIGHT_PIN  GPIO_PIN_2
+#define PIN_START_BTN_PORT   GPIOC
+#define PIN_START_BTN_PIN    GPIO_PIN_8
+
 /* ── ADC calibration ── */
 #define ADC_REF          3.3f
 #define ADC_MAX          4095.0f
@@ -180,6 +186,8 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 
+volatile bool isBrakePressed = false;
+
 /* ── Raw ADC readings ── */
 static uint32_t adc_apps1 = 0;
 static uint32_t adc_apps2 = 0;
@@ -215,6 +223,7 @@ static void MX_ADC3_Init(void);
 static void MX_CAN1_Init(void);
 
 /* USER CODE BEGIN PFP */
+void updateBrakeLight(void);
 static void MX_TIM2_Init(void);
 static void     Read_ADC_Values(void);
 static void     Process_Pedals(void);
@@ -239,6 +248,17 @@ static void GPIO_Out3_Set(GPIO_PinState state);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void updateBrakeLight(void)
+{
+    if (brake_norm > 0.10f) {
+        HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_SET);
+        isBrakePressed = true;
+    } else {
+        HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_RESET);
+        isBrakePressed = false;
+    }
+}
 
 /**
  * @brief  Clamp a float to [lo, hi].
@@ -468,6 +488,8 @@ int main(void)
         /* ── 2. Convert to normalised pedal positions ── */
         Process_Pedals();
 
+        updateBrakeLight();
+
         /* ── 3. APPS plausibility check (10 % mismatch limit) ──────────
          *   If the two accelerator sensors disagree by more than 10 %
          *   the ECU must zero both channels.  This detects sensor
@@ -517,14 +539,7 @@ int main(void)
         }
 
         /* ── GPIO 2 : turn ON when brake is actively pressed ── */
-        if (brake_active)
-        {
-            GPIO_Out2_Set(GPIO_PIN_SET);
-        }
-        else
-        {
-            GPIO_Out2_Set(GPIO_PIN_RESET);
-        }
+        // Remplacé par updateBrakeLight() qui gère PIN_BRAKE_LIGHT_PIN (PC2) avec un seuil de 10%
 
         /* ── GPIO 3 : turn ON when APPS mismatch fault is present ── */
         if (apps_diff > APPS_MISMATCH_THRESHOLD)
