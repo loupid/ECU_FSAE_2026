@@ -196,6 +196,12 @@ static bool lockout_cleared = false;
 
 int16_t g_speed = 0; // RPM
 
+/* ── Variable partagée entre le main et l'interruption Timer ── */
+volatile float g_torque_demand = 0.0f;
+volatile uint8_t g_inverter_enable = 0;
+
+TIM_HandleTypeDef htim2; /* Déclaration manuelle car CubeMX ne l'a pas fait */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -209,12 +215,13 @@ static void MX_ADC3_Init(void);
 static void MX_CAN1_Init(void);
 
 /* USER CODE BEGIN PFP */
+static void MX_TIM2_Init(void);
 static void     Read_ADC_Values(void);
 static void     Process_Pedals(void);
 static void     CAN_SendCommand(float torque_norm, bool enable_inverter);
 static float    Clampf(float v, float lo, float hi);
 
-void drive_cmd_tx (int16_t torque, int16_t speed, uint8_t dir, uint8_t inverter_enable,
+void drive_cmd_tx (float torque, int16_t speed, uint8_t dir, uint8_t inverter_enable,
                      uint8_t inverter_discharge, uint8_t speed_mode_enable, int16_t torque_lim);
 void drive_param_write (uint16_t param_addr, uint16_t data);
 void can_byte_tx (uint8_t val);
@@ -275,18 +282,24 @@ static void GPIO_Out3_Set(GPIO_PinState state)
 static void Read_ADC_Values(void)
 {
     HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-    adc_apps1 = HAL_ADC_GetValue(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 5) == HAL_OK)
+    {
+        adc_apps1 = HAL_ADC_GetValue(&hadc1);
+    }
     HAL_ADC_Stop(&hadc1);
 
     HAL_ADC_Start(&hadc2);
-    HAL_ADC_PollForConversion(&hadc2, HAL_MAX_DELAY);
-    adc_apps2 = HAL_ADC_GetValue(&hadc2);
+    if (HAL_ADC_PollForConversion(&hadc2, 5) == HAL_OK)
+    {
+        adc_apps2 = HAL_ADC_GetValue(&hadc2);
+    }
     HAL_ADC_Stop(&hadc2);
 
     HAL_ADC_Start(&hadc3);
-    HAL_ADC_PollForConversion(&hadc3, HAL_MAX_DELAY);
-    adc_brake = HAL_ADC_GetValue(&hadc3);
+    if (HAL_ADC_PollForConversion(&hadc3, 5) == HAL_OK)
+    {
+        adc_brake = HAL_ADC_GetValue(&hadc3);
+    }
     HAL_ADC_Stop(&hadc3);
 }
 
@@ -437,6 +450,9 @@ int main(void)
     GPIO_Out2_Set(GPIO_PIN_RESET);
     GPIO_Out3_Set(GPIO_PIN_RESET);
 
+    MX_TIM2_Init();
+    HAL_TIM_Base_Start_IT(&htim2); /* Démarrage du TIM2 pour la boucle CAN 10 ms */
+
     /* USER CODE END 2 */
 
     /* ================================================================
@@ -478,24 +494,9 @@ int main(void)
             torque_demand = 0.0f;
         }
 
-        /* ── 6. Send CAN Command Message ── */
-        /*   Inverter is enabled as long as the lockout has been cleared.
-         *   You can add your own logic here (e.g. a start button) to
-         *   decide when to actually enable the inverter.              */
-        //bool inverter_enable = lockout_cleared;   /* ← adjust as needed */
-        //CAN_SendCommand(torque_demand, inverter_enable);
-
-#if 01
-		can_word_tx(g_speed); // Envoie un message contenant la vitesse actuelle
-		can_dword_tx(adc_apps1);
-#endif
-		uint8_t inverter_enable = torque_demand > 0 ? 1 : 0;
-		uint8_t inverter_discharge = 0;
-		uint8_t speed_mode_enable = 0;
-		int16_t torque_lim = 0;
-
-		drive_cmd_tx (torque_demand, SPEED_MAX, DIR_FORWARD, inverter_enable,
-						inverter_discharge, speed_mode_enable, torque_lim);
+        /* ── Mettre à jour les variables globales pour le Timer ── */
+        g_torque_demand = torque_demand;
+        g_inverter_enable = (torque_demand > 0) ? 1 : 0;
 
         /* ================================================================
          *  GPIO OUTPUT EXAMPLES
@@ -535,8 +536,8 @@ int main(void)
             GPIO_Out3_Set(GPIO_PIN_RESET);
         }
 
-        /* ── Loop delay : 10 ms → 100 Hz heartbeat ── */
-        HAL_Delay(LOOP_PERIOD_MS);
+        /* ── Loop delay : 1 ms pour ne pas étouffer le CPU ── */
+        HAL_Delay(1);
 
         /* USER CODE END WHILE */
 
@@ -783,6 +784,62 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* Activation de l'horloge TIM2 */
+  __HAL_RCC_TIM2_CLK_ENABLE();
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 89;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Configuration de l'interruption (Priorité et Activation) */
+  HAL_NVIC_SetPriority(TIM2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(TIM2_IRQn);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2)
+    {
+        uint8_t inverter_discharge = 0;
+        uint8_t speed_mode_enable = 0;
+        int16_t torque_lim = 0;
+
+        // Envoi de la commande à l'inverter avec les valeurs les plus récentes
+        drive_cmd_tx (g_torque_demand, SPEED_MAX, DIR_FORWARD, g_inverter_enable,
+                        inverter_discharge, speed_mode_enable, torque_lim);
+
+#if 01
+        // Envoi des messages de debug (pour ne pas saturer le CAN dans le while(1))
+        can_word_tx(g_speed); 
+        can_dword_tx(adc_apps1);
+#endif
+    }
+}
+
 /**
  * Send torque/speed command to motor drive
  *
@@ -812,7 +869,7 @@ static void MX_GPIO_Init(void)
  *
  * \param torque_lim [in] Motor and Regen max torque. 0 = keep default limits in EEPROM.
  */
-void drive_cmd_tx (int16_t torque_norm, int16_t speed, uint8_t dir, uint8_t inverter_enable,
+void drive_cmd_tx (float torque_norm, int16_t speed, uint8_t dir, uint8_t inverter_enable,
                      uint8_t inverter_discharge, uint8_t speed_mode_enable, int16_t torque_lim)
 {
 	static CAN_TxHeaderTypeDef hdr = {
