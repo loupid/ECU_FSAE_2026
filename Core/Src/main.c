@@ -144,7 +144,10 @@ typedef struct
 #define RESERVED_BYTE (0)
 
 #define BYTE_MASK (0xFF)
-#define HIGH_BYTE_OFFSET (8)
+#define BYTE_WIDTH (8)
+#define BYTE_SIZE (1)
+#define WORD_SIZE (2)
+#define DWORD_SIZE (4)
 
 /* USER CODE END PD */
 
@@ -158,8 +161,9 @@ typedef struct
 #define SPEED_MAX (4000) // RPM
 
 #define GET_LOW_BYTE(__word__) ((__word__) & BYTE_MASK)
-#define GET_HIGH_BYTE(__word__) (((__word__) >> HIGH_BYTE_OFFSET) & BYTE_MASK)
-#define GET_WORD(__low_byte__, __high_byte__) ((__low_byte__) | ((__high_byte__) << HIGH_BYTE_OFFSET))
+#define GET_HIGH_BYTE(__word__) (((__word__) >> BYTE_WIDTH) & BYTE_MASK)
+#define GET_BYTE(__dword__, __index__) (((__dword__) >> (__index__ * BYTE_WIDTH)) & BYTE_MASK)
+#define GET_WORD(__low_byte__, __high_byte__) ((__low_byte__) | ((__high_byte__) << BYTE_WIDTH))
 
 /* USER CODE END PM */
 
@@ -215,6 +219,7 @@ void drive_cmd_tx (int16_t torque, int16_t speed, uint8_t dir, uint8_t inverter_
 void drive_param_write (uint16_t param_addr, uint16_t data);
 void can_byte_tx (uint8_t val);
 void can_word_tx (uint16_t word);
+void can_dword_tx (uint32_t dword);
 void can_msg_parse (CAN_RxHeaderTypeDef* p_header, uint8_t* p_data);
 int lin_map (int val, int in_min, int in_max, int out_min, int out_max);
 int limit (int val, int min, int max);
@@ -482,6 +487,7 @@ int main(void)
 
 #if 01
 		can_word_tx(g_speed); // Envoie un message contenant la vitesse actuelle
+		can_dword_tx(adc_apps1);
 #endif
 		uint8_t inverter_enable = torque_demand > 0 ? 1 : 0;
 		uint8_t inverter_discharge = 0;
@@ -875,10 +881,10 @@ void drive_param_write (uint16_t param_addr, uint16_t data)
 void can_byte_tx (uint8_t val)
 {
 	static CAN_TxHeaderTypeDef hdr = {
-		.StdId              = 0x0DB,
+		.StdId              = 0x1DB,
 		.IDE                = CAN_ID_STD,
 		.RTR                = CAN_RTR_DATA,
-		.DLC                = 1,
+		.DLC                = BYTE_SIZE,
 		.TransmitGlobalTime = DISABLE,
 	};
 
@@ -897,18 +903,43 @@ void can_byte_tx (uint8_t val)
 void can_word_tx (uint16_t word)
 {
 	static CAN_TxHeaderTypeDef hdr = {
-		.StdId              = 0x1DB,
+		.StdId              = 0x2DB,
 		.IDE                = CAN_ID_STD,
 		.RTR                = CAN_RTR_DATA,
-		.DLC                = 2,
+		.DLC                = WORD_SIZE,
 		.TransmitGlobalTime = DISABLE,
 	};
 
     uint32_t mailbox;
-	static uint8_t bytes[2];
+	static uint8_t bytes[WORD_SIZE];
 
 	bytes[0] = GET_LOW_BYTE(word);
 	bytes[1] = GET_HIGH_BYTE(word);
+
+    /* Send only when a mailbox is free */
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        HAL_CAN_AddTxMessage(&hcan1, &hdr, bytes, &mailbox);
+    }
+}
+
+void can_dword_tx (uint32_t dword)
+{
+	static CAN_TxHeaderTypeDef hdr = {
+		.StdId              = 0x4DB,
+		.IDE                = CAN_ID_STD,
+		.RTR                = CAN_RTR_DATA,
+		.DLC                = DWORD_SIZE,
+		.TransmitGlobalTime = DISABLE,
+	};
+
+    uint32_t mailbox;
+	static uint8_t bytes[DWORD_SIZE];
+
+	bytes[0] = GET_BYTE(dword, 0);
+	bytes[1] = GET_BYTE(dword, 1);
+	bytes[2] = GET_BYTE(dword, 2);
+	bytes[3] = GET_BYTE(dword, 3);
 
     /* Send only when a mailbox is free */
     if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
