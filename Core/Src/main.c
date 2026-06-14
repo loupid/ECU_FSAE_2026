@@ -44,10 +44,17 @@
 #include <stdbool.h>
 
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+    STATE_OFF,
+    STATE_PRECHARGE,
+    STATE_READY_TO_DRIVE
+} VehicleState;
+
 typedef enum
 {
 	DIR_FORWARD = 0, ///< Counter-clockwise motor rotation
@@ -65,11 +72,22 @@ typedef struct
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define DESK_TEST_MODE 1
+
 /* ── Pins VCU custom ── */
 #define PIN_BRAKE_LIGHT_PORT GPIOC
 #define PIN_BRAKE_LIGHT_PIN  GPIO_PIN_2
 #define PIN_START_BTN_PORT   GPIOC
 #define PIN_START_BTN_PIN    GPIO_PIN_8
+
+#define PIN_AIR_NEG_PORT   GPIOC
+#define PIN_AIR_NEG_PIN    GPIO_PIN_1
+#define PIN_PRECHARGE_PORT GPIOC
+#define PIN_PRECHARGE_PIN  GPIO_PIN_7
+#define PIN_AIR_POS_PORT   GPIOC
+#define PIN_AIR_POS_PIN    GPIO_PIN_9
+#define PIN_BUZZER_PORT    GPIOD
+#define PIN_BUZZER_PIN     GPIO_PIN_14
 
 /* ── ADC calibration ── */
 #define ADC_REF          3.3f
@@ -186,7 +204,15 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 
+volatile float accumulator_voltage = 300.0f; // TODO: Mettre à jour via CAN BMS
+volatile float inverter_voltage = 0.0f;      // TODO: Mettre à jour via CAN Inverter (0x0A7)
+
+volatile VehicleState currentState = STATE_OFF;
 volatile bool isBrakePressed = false;
+
+uint32_t precharge_start_time = 0;
+uint32_t rtds_start_time = 0;
+bool rtds_playing = false;
 
 /* ── Raw ADC readings ── */
 static uint32_t adc_apps1 = 0;
@@ -223,6 +249,7 @@ static void MX_ADC3_Init(void);
 static void MX_CAN1_Init(void);
 
 /* USER CODE BEGIN PFP */
+void handleStateMachine(void);
 void updateBrakeLight(void);
 static void MX_TIM2_Init(void);
 static void     Read_ADC_Values(void);
@@ -249,14 +276,105 @@ static void GPIO_Out3_Set(GPIO_PinState state);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+#if DESK_TEST_MODE
+int _write(int file, char *ptr, int len) {
+    HAL_UART_Transmit(&huart3, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+#endif
+
 void updateBrakeLight(void)
 {
+#if DESK_TEST_MODE
+    if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
+        brake_norm = 1.0f; // Force 100% de frein
+    }
+#endif
+
     if (brake_norm > 0.10f) {
         HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_SET);
+#if DESK_TEST_MODE
+        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+#endif
         isBrakePressed = true;
     } else {
         HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_RESET);
+#if DESK_TEST_MODE
+        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+#endif
         isBrakePressed = false;
+    }
+}
+
+void handleStateMachine(void)
+{
+    switch (currentState) {
+        case STATE_OFF:
+        {
+#if DESK_TEST_MODE
+            bool start_pressed = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+#else
+            bool start_pressed = (HAL_GPIO_ReadPin(PIN_START_BTN_PORT, PIN_START_BTN_PIN) == GPIO_PIN_SET);
+#endif
+            if (start_pressed && isBrakePressed) {
+                currentState = STATE_PRECHARGE;
+                precharge_start_time = HAL_GetTick();
+                
+                // Fermer AIR- et Precharge Relay
+                HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_SET);
+            }
+            break;
+        }
+            
+        case STATE_PRECHARGE:
+        {
+            bool precharge_complete = false;
+            
+#if DESK_TEST_MODE
+            // Simulation : on attend 2 secondes pour simuler la montée de tension à 90%
+            if (HAL_GetTick() - precharge_start_time > 2000) {
+                precharge_complete = true;
+            }
+#else
+            // Voiture réelle : Vérifier que la tension inverter >= 90% tension batterie
+            if (inverter_voltage >= (accumulator_voltage * 0.90f)) {
+                precharge_complete = true;
+            }
+            
+            // Timeout de sécurité : si ça prend plus de 3 secondes, on annule tout !
+            if (!precharge_complete && (HAL_GetTick() - precharge_start_time > 3000)) {
+                HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
+                currentState = STATE_OFF; // ERREUR PRECHARGE
+                break;
+            }
+#endif
+
+            if (precharge_complete) {
+                // Tension OK ! On ferme AIR+ et on ouvre Precharge
+                HAL_GPIO_WritePin(PIN_AIR_POS_PORT, PIN_AIR_POS_PIN, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
+                
+                // Démarrage du RTDS (Buzzer)
+                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_SET);
+                rtds_start_time = HAL_GetTick();
+                rtds_playing = true;
+                
+                currentState = STATE_READY_TO_DRIVE;
+            }
+            break;
+        }
+            
+        case STATE_READY_TO_DRIVE:
+        {
+            // Eteindre le buzzer après 2 secondes
+            if (rtds_playing && (HAL_GetTick() - rtds_start_time > 2000)) {
+                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
+                rtds_playing = false;
+            }
+            break;
+        }
     }
 }
 
@@ -434,6 +552,15 @@ int main(void)
 
     /* USER CODE BEGIN 2 */
 
+    // Init Buzzer Pin PD14 (Si pas déjà fait dans CubeMX)
+    GPIO_InitTypeDef GPIO_InitStruct_Buzzer = {0};
+    GPIO_InitStruct_Buzzer.Pin = PIN_BUZZER_PIN;
+    GPIO_InitStruct_Buzzer.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct_Buzzer.Pull = GPIO_NOPULL;
+    GPIO_InitStruct_Buzzer.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PIN_BUZZER_PORT, &GPIO_InitStruct_Buzzer);
+    HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
+
     /* ── Enable auto-retransmission (important for reliability) ── */
     hcan1.Init.AutoRetransmission = ENABLE;
 
@@ -489,6 +616,7 @@ int main(void)
         Process_Pedals();
 
         updateBrakeLight();
+        handleStateMachine();
 
         /* ── 3. APPS plausibility check (10 % mismatch limit) ──────────
          *   If the two accelerator sensors disagree by more than 10 %
@@ -518,7 +646,25 @@ int main(void)
 
         /* ── Mettre à jour les variables globales pour le Timer ── */
         g_torque_demand = torque_demand;
-        g_inverter_enable = (torque_demand > 0) ? 1 : 0;
+        g_inverter_enable = (torque_demand > 0 && currentState == STATE_READY_TO_DRIVE) ? 1 : 0;
+
+#if DESK_TEST_MODE
+        static uint32_t last_print_time = 0;
+        if (HAL_GetTick() - last_print_time > 500) {
+            const char* state_str = "UNKNOWN";
+            switch(currentState) {
+                case STATE_OFF: state_str = "OFF"; break;
+                case STATE_PRECHARGE: state_str = "PRECHARGE"; break;
+                case STATE_READY_TO_DRIVE: state_str = "READY"; break;
+            }
+            printf("State: %s | Brake: %d%% | APPS: %d%% | Light: %s\r\n", 
+                state_str,
+                (int)(brake_norm * 100), 
+                (int)(torque_demand * 100), 
+                isBrakePressed ? "ON" : "OFF");
+            last_print_time = HAL_GetTick();
+        }
+#endif
 
         /* ================================================================
          *  GPIO OUTPUT EXAMPLES
