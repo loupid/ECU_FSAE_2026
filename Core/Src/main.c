@@ -204,6 +204,8 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 
+volatile uint8_t inverter_lockout_state = 1;
+
 volatile float accumulator_voltage = 300.0f; // TODO: Mettre à jour via CAN BMS
 volatile float inverter_voltage = 0.0f;      // TODO: Mettre à jour via CAN Inverter (0x0A7)
 
@@ -1177,6 +1179,10 @@ void can_msg_parse (CAN_RxHeaderTypeDef* p_header, uint8_t* p_data)
 		case DRIVE_MOTOR_POS_INFO_CAN_ID:
 			g_speed = GET_WORD(p_data[2], p_data[3]);
 			break;
+
+        case DRIVE_INTERNAL_STATE_CAN_ID_CAN_ID:
+            inverter_lockout_state = p_data[6] & 0x01;
+            break;
 
 		default:
 			// todo
