@@ -689,8 +689,8 @@ int main(void)
         /* ── GPIO 2 : turn ON when brake is actively pressed ── */
         // Remplacé par updateBrakeLight() qui gère PIN_BRAKE_LIGHT_PIN (PC2) avec un seuil de 10%
 
-        /* ── GPIO 3 : turn ON when APPS mismatch fault is present ── */
-        if (apps_diff > APPS_MISMATCH_THRESHOLD)
+        /* ── GPIO 3 : turn ON when APPS mismatch fault OR Inverter Lockout is present ── */
+        if (apps_diff > APPS_MISMATCH_THRESHOLD || inverter_lockout_state == 0)
         {
             GPIO_Out3_Set(GPIO_PIN_SET);    /* fault indicator */
         }
@@ -1182,6 +1182,14 @@ void can_msg_parse (CAN_RxHeaderTypeDef* p_header, uint8_t* p_data)
 
         case DRIVE_INTERNAL_STATE_CAN_ID_CAN_ID:
             inverter_lockout_state = p_data[6] & 0x01;
+            break;
+
+        case DRIVE_VOLTAGE_INFO_CAN_ID:
+            inverter_voltage = (float)GET_WORD(p_data[0], p_data[1]) * 0.1f;
+            break;
+
+        case 0x6B0:
+            accumulator_voltage = (float)GET_WORD(p_data[2], p_data[3]);
             break;
 
 		default:
