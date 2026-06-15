@@ -589,22 +589,55 @@ int main(void)
         updateBrakeLight();
         handleStateMachine();
 
-        /* ── 3. APPS plausibility check (10 % mismatch limit) ──────────
-         *   If the two accelerator sensors disagree by more than 10 %
-         *   the ECU must zero both channels.  This detects sensor
-         *   failure or wiring faults per automotive APPS safety rules.  */
+        /* ── Variables statiques pour mémoriser les états de plausibilité ── */
+        static uint32_t apps_mismatch_start_time = 0;
+        static bool apps_mismatch_fault = false;
+        static bool apps_brake_fault = false;
+
+        /* ── 3. APPS Mismatch Plausibility (Règles T.4.2.4 & T.4.2.5) ────────
+         * Si l'écart dépasse 10% pendant plus de 100ms, couper la puissance. */
         float apps_diff = apps1_norm - apps2_norm;
         if (apps_diff < 0.0f) apps_diff = -apps_diff;
 
-        if (apps_diff > APPS_MISMATCH_THRESHOLD)
+        if (apps_diff > APPS_MISMATCH_THRESHOLD) 
         {
-            apps1_norm = 0.0f;
-            apps2_norm = 0.0f;
+            if (apps_mismatch_start_time == 0) {
+                apps_mismatch_start_time = HAL_GetTick(); // Démarrer le chrono
+            } else if (HAL_GetTick() - apps_mismatch_start_time >= 100) {
+                apps_mismatch_fault = true; // Le défaut persiste > 100ms : FAULT !
+            }
+        } 
+        else 
+        {
+            apps_mismatch_start_time = 0;  // Réinitialiser le chrono
+            apps_mismatch_fault = false; // L'écart est redevenu normal, on enlève le défaut
         }
 
-        /* ── 4. Compute final torque demand ── */
-        float torque_demand = (apps1_norm + apps2_norm) * 0.5f;
+        /* ── 4. Brake / APPS Plausibility Check (Règle EV.4.7) ───────────────
+         * Si Frein activé ET APPS > 25%, verrouiller le couple à 0.
+         * Le verrouillage ne s'enlève QUE quand APPS < 5%. */
+        float apps_avg = (apps1_norm + apps2_norm) * 0.5f;
+        bool brake_active = (brake_norm > BRAKE_OVERRIDE_THRESHOLD);
 
+        if (brake_active && apps_avg > 0.25f) 
+        {
+            apps_brake_fault = true; // Engager le verrouillage
+        } 
+        else if (apps_avg < 0.05f) 
+        {
+            apps_brake_fault = false; // Retirer le verrouillage SEULEMENT sous 5%
+        }
+
+        /* ── 5. Calcul du couple final demandé ────────────────────────────── */
+        float torque_demand = apps_avg;
+
+        // Si l'un des deux défauts de plausibilité est actif, on coupe tout de suite
+        if (apps_mismatch_fault || apps_brake_fault) 
+        {
+            torque_demand = 0.0f;
+        }
+
+        /* ── 6. Derating (Limitation de Puissance 4.41 kW) ────────────────── */
         float target_torque_nm = torque_demand * MAX_TORQUE_NM;
         float speed_rad_s = (float)g_speed * 0.10472f;
 
@@ -616,29 +649,17 @@ int main(void)
         }
         torque_demand = target_torque_nm / MAX_TORQUE_NM;
 
-        /* ── 5. Brake override ──────────────────────────────────────────
-         *   If brake pressure exceeds 20 % the torque command is forced
-         *   to zero regardless of accelerator position.  This prevents
-         *   simultaneous acceleration and braking (APPS+brake check).  */
-        bool brake_active = (brake_norm > BRAKE_OVERRIDE_THRESHOLD);
-        if (brake_active)
-        {
-            torque_demand = 0.0f;
-        }
-
-        /* ── Mettre à jour les variables globales pour le Timer ── */
+        /* ── 7. Mettre à jour les variables globales pour le Timer CAN ────── */
         if (currentState == STATE_READY_TO_DRIVE) {
             g_torque_demand = torque_demand;
-            g_inverter_enable = 1; // L'inverter reste activé dans READY_TO_DRIVE
+            g_inverter_enable = 1;
         } else {
             g_torque_demand = 0.0f;
             g_inverter_enable = 0;
         }
 
-
-
         /* ── Voyant d'erreur (Fault LED sur PC3) ── */
-        if (apps_diff > APPS_MISMATCH_THRESHOLD || inverter_lockout_state == 0)
+        if (apps_mismatch_fault || apps_brake_fault || inverter_lockout_state == 0)
         {
             HAL_GPIO_WritePin(PIN_FAULT_LED_PORT, PIN_FAULT_LED_PIN, GPIO_PIN_SET);
         }
