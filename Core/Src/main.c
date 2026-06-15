@@ -75,8 +75,6 @@ typedef struct
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define DESK_TEST_MODE 1
-
 /* ── Pins VCU custom ── */
 #define PIN_BRAKE_LIGHT_PORT GPIOC
 #define PIN_BRAKE_LIGHT_PIN  GPIO_PIN_2
@@ -92,25 +90,18 @@ typedef struct
 #define PIN_BUZZER_PORT    GPIOD
 #define PIN_BUZZER_PIN     GPIO_PIN_14
 
+#define PIN_SHUTDOWN_PORT  GPIOG
+#define PIN_SHUTDOWN_PIN   GPIO_PIN_9
+
 /* ── ADC calibration ── */
 #define ADC_REF          3.3f
 #define ADC_MAX          4095.0f
 
-/* ── Test Mode Configuration ── */
-#define TEST_SINGLE_POTENTIOMETER  0  /* Set to 1 for bench testing with 1 pot on PA0, 0 for dual-channel APPS */
-
 /* ── Accelerator sensor voltage limits ── */
-#if TEST_SINGLE_POTENTIOMETER
-#define APPS1_V_MIN      1.7f    /* idle voltage sensor 1 (1.7 V) */
-#define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 (3.0 V) */
-#define APPS2_V_MIN      0.875f
-#define APPS2_V_MAX      1.5f
-#else
 #define APPS1_V_MIN      1.8f    /* idle voltage sensor 1 */
 #define APPS1_V_MAX      3.0f    /* WOT  voltage sensor 1 */
 #define APPS2_V_MIN      0.9f   /* idle voltage sensor 2 */
 #define APPS2_V_MAX      1.5f    /* WOT  voltage sensor 2 */
-#endif
 
 /* ── Brake sensor voltage limits ── */
 #define BRK_V_MIN        0.5f    /* released */
@@ -273,32 +264,15 @@ int limit (int val, int min, int max);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#if DESK_TEST_MODE
-int _write(int file, char *ptr, int len) {
-    HAL_UART_Transmit(&huart3, (uint8_t*)ptr, len, HAL_MAX_DELAY);
-    return len;
-}
-#endif
+
 
 void updateBrakeLight(void)
 {
-#if DESK_TEST_MODE
-    if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
-        brake_norm = 1.0f; // Force 100% de frein
-    }
-#endif
-
     if (brake_norm > 0.10f) {
         HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_SET);
-#if DESK_TEST_MODE
-        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-#endif
         isBrakePressed = true;
     } else {
         HAL_GPIO_WritePin(PIN_BRAKE_LIGHT_PORT, PIN_BRAKE_LIGHT_PIN, GPIO_PIN_RESET);
-#if DESK_TEST_MODE
-        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-#endif
         isBrakePressed = false;
     }
 }
@@ -308,8 +282,15 @@ void handleStateMachine(void)
     switch (currentState) {
         case STATE_GLV_ON:
         {
-            currentState = STATE_PRECHARGE;
-            precharge_start_time = HAL_GetTick();
+            // Lecture du Shutdown Circuit (3.3V = fermé)
+            bool sdc_closed = (HAL_GPIO_ReadPin(PIN_SHUTDOWN_PORT, PIN_SHUTDOWN_PIN) == GPIO_PIN_SET);
+            
+
+
+            if (sdc_closed) {
+                currentState = STATE_PRECHARGE;
+                precharge_start_time = HAL_GetTick();
+            }
             break;
         }
             
@@ -320,11 +301,6 @@ void handleStateMachine(void)
 
             bool precharge_complete = false;
             
-#if DESK_TEST_MODE
-            if (HAL_GetTick() - precharge_start_time > 2000) {
-                precharge_complete = true;
-            }
-#else
             if (inverter_voltage >= (accumulator_voltage * 0.90f)) {
                 precharge_complete = true;
             }
@@ -333,7 +309,6 @@ void handleStateMachine(void)
                 currentState = STATE_FAULT;
                 break;
             }
-#endif
 
             if (precharge_complete) {
                 HAL_GPIO_WritePin(PIN_AIR_POS_PORT, PIN_AIR_POS_PIN, GPIO_PIN_SET);
@@ -346,11 +321,7 @@ void handleStateMachine(void)
             
         case STATE_TS_ACTIVE:
         {
-#if DESK_TEST_MODE
-            bool start_pressed = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
-#else
             bool start_pressed = (HAL_GPIO_ReadPin(PIN_START_BTN_PORT, PIN_START_BTN_PIN) == GPIO_PIN_SET);
-#endif
             if (brake_norm > 0.20f && start_pressed) {
                 currentState = STATE_RTDS;
                 rtds_start_time = HAL_GetTick();
@@ -442,11 +413,7 @@ static void Process_Pedals(void)
     float vb = (adc_brake  * ADC_REF) / ADC_MAX;
 
     apps1_norm = (v1 - APPS1_V_MIN) / (APPS1_V_MAX - APPS1_V_MIN);
-#if TEST_SINGLE_POTENTIOMETER
-    apps2_norm = apps1_norm; /* In test mode, copy APPS1 to APPS2 to prevent mismatch fault */
-#else
     apps2_norm = (v2 - APPS2_V_MIN) / (APPS2_V_MAX - APPS2_V_MIN);
-#endif
     brake_norm = (vb - BRK_V_MIN)   / (BRK_V_MAX   - BRK_V_MIN);
 
     apps1_norm = Clampf(apps1_norm, 0.0f, 1.0f);
@@ -545,6 +512,14 @@ int main(void)
     GPIO_InitStruct_Buzzer.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(PIN_BUZZER_PORT, &GPIO_InitStruct_Buzzer);
     HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
+
+    // Init Shutdown Circuit Pin PG9
+    __HAL_RCC_GPIOG_CLK_ENABLE(); // S'assurer que l'horloge du port G est activée
+    GPIO_InitTypeDef GPIO_InitStruct_SDC = {0};
+    GPIO_InitStruct_SDC.Pin = PIN_SHUTDOWN_PIN;
+    GPIO_InitStruct_SDC.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct_SDC.Pull = GPIO_PULLDOWN; // Pulldown pour éviter les déclenchements parasites si le fil est débranché
+    HAL_GPIO_Init(PIN_SHUTDOWN_PORT, &GPIO_InitStruct_SDC);
 
     /* ── Enable auto-retransmission (important for reliability) ── */
     hcan1.Init.AutoRetransmission = ENABLE;
@@ -647,26 +622,7 @@ int main(void)
             g_inverter_enable = 0;
         }
 
-#if DESK_TEST_MODE
-        static uint32_t last_print_time = 0;
-        if (HAL_GetTick() - last_print_time > 500) {
-            const char* state_str = "UNKNOWN";
-            switch(currentState) {
-                case STATE_GLV_ON: state_str = "GLV_ON"; break;
-                case STATE_PRECHARGE: state_str = "PRECHARGE"; break;
-                case STATE_TS_ACTIVE: state_str = "TS_ACTIVE"; break;
-                case STATE_RTDS: state_str = "RTDS"; break;
-                case STATE_READY_TO_DRIVE: state_str = "READY"; break;
-                case STATE_FAULT: state_str = "FAULT"; break;
-            }
-            printf("State: %s | Brake: %d%% | APPS: %d%% | Light: %s\r\n", 
-                state_str,
-                (int)(brake_norm * 100), 
-                (int)(torque_demand * 100), 
-                isBrakePressed ? "ON" : "OFF");
-            last_print_time = HAL_GetTick();
-        }
-#endif
+
 
         /* ── Voyant d'erreur (Fault LED sur PC3) ── */
         if (apps_diff > APPS_MISMATCH_THRESHOLD || inverter_lockout_state == 0)
