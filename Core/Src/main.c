@@ -508,8 +508,8 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
-    MX_USART3_UART_Init();
-    MX_USB_OTG_FS_PCD_Init();
+    /* MX_USART3_UART_Init(); */
+    /* MX_USB_OTG_FS_PCD_Init(); */
     MX_ADC1_Init();
     MX_ADC2_Init();
     MX_ADC3_Init();
@@ -943,7 +943,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         drive_cmd_tx (g_torque_demand, SPEED_MAX, DIR_FORWARD, g_inverter_enable,
                         inverter_discharge, speed_mode_enable, torque_lim);
 
-#if 01
+#if 0
         // Envoi des messages de debug (pour ne pas saturer le CAN dans le while(1))
         can_word_tx(g_speed); 
         can_dword_tx(adc_apps1);
