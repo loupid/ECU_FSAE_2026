@@ -93,6 +93,8 @@ typedef struct
 #define PIN_SHUTDOWN_PORT  GPIOG
 #define PIN_SHUTDOWN_PIN   GPIO_PIN_9
 
+#define IS_SDC_CLOSED()    (HAL_GPIO_ReadPin(PIN_SHUTDOWN_PORT, PIN_SHUTDOWN_PIN) == GPIO_PIN_SET)
+
 /* ── ADC calibration ── */
 #define ADC_REF          3.3f
 #define ADC_MAX          4095.0f
@@ -279,15 +281,17 @@ void updateBrakeLight(void)
 
 void handleStateMachine(void)
 {
+    // Sécurité globale : SDC ouvert hors GLV_ON et FAULT -> force FAULT
+    if (currentState != STATE_GLV_ON && currentState != STATE_FAULT) {
+        if (!IS_SDC_CLOSED()) {
+            currentState = STATE_FAULT;
+        }
+    }
+
     switch (currentState) {
         case STATE_GLV_ON:
         {
-            // Lecture du Shutdown Circuit (3.3V = fermé)
-            bool sdc_closed = (HAL_GPIO_ReadPin(PIN_SHUTDOWN_PORT, PIN_SHUTDOWN_PIN) == GPIO_PIN_SET);
-            
-
-
-            if (sdc_closed) {
+            if (IS_SDC_CLOSED()) {
                 currentState = STATE_PRECHARGE;
                 precharge_start_time = HAL_GetTick();
             }
@@ -322,7 +326,7 @@ void handleStateMachine(void)
         case STATE_TS_ACTIVE:
         {
             bool start_pressed = (HAL_GPIO_ReadPin(PIN_START_BTN_PORT, PIN_START_BTN_PIN) == GPIO_PIN_SET);
-            if (brake_norm > 0.20f && start_pressed) {
+            if (brake_norm > 0.10f && start_pressed) {
                 currentState = STATE_RTDS;
                 rtds_start_time = HAL_GetTick();
                 HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_SET);
@@ -332,7 +336,7 @@ void handleStateMachine(void)
 
         case STATE_RTDS:
         {
-            if (HAL_GetTick() - rtds_start_time > 2000) {
+            if (HAL_GetTick() - rtds_start_time >= 2000) {
                 HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
                 g_inverter_enable = 1;
                 currentState = STATE_READY_TO_DRIVE;
@@ -353,6 +357,15 @@ void handleStateMachine(void)
             HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
             g_inverter_enable = 0;
             g_torque_demand = 0.0f;
+            
+            // Attends que le Shutdown Circuit soit réarmé pour retourner à STATE_GLV_ON.
+            static bool sdc_was_opened = false;
+            if (!IS_SDC_CLOSED()) {
+                sdc_was_opened = true;
+            } else if (sdc_was_opened && IS_SDC_CLOSED()) {
+                sdc_was_opened = false;
+                currentState = STATE_GLV_ON;
+            }
             break;
         }
     }
