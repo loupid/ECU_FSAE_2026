@@ -50,10 +50,13 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum {
-    STATE_OFF,
+    STATE_GLV_ON,
     STATE_PRECHARGE,
-    STATE_READY_TO_DRIVE
-} VehicleState;
+    STATE_TS_ACTIVE,
+    STATE_RTDS,
+    STATE_READY_TO_DRIVE,
+    STATE_FAULT
+} VCU_State;
 
 typedef enum
 {
@@ -209,7 +212,7 @@ volatile uint8_t inverter_lockout_state = 1;
 volatile float accumulator_voltage = 300.0f; // TODO: Mettre à jour via CAN BMS
 volatile float inverter_voltage = 0.0f;      // TODO: Mettre à jour via CAN Inverter (0x0A7)
 
-volatile VehicleState currentState = STATE_OFF;
+volatile VCU_State currentState = STATE_GLV_ON;
 volatile bool isBrakePressed = false;
 
 uint32_t precharge_start_time = 0;
@@ -311,70 +314,82 @@ void updateBrakeLight(void)
 void handleStateMachine(void)
 {
     switch (currentState) {
-        case STATE_OFF:
+        case STATE_GLV_ON:
+        {
+            currentState = STATE_PRECHARGE;
+            precharge_start_time = HAL_GetTick();
+            break;
+        }
+            
+        case STATE_PRECHARGE:
+        {
+            HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_SET);
+
+            bool precharge_complete = false;
+            
+#if DESK_TEST_MODE
+            if (HAL_GetTick() - precharge_start_time > 2000) {
+                precharge_complete = true;
+            }
+#else
+            if (inverter_voltage >= (accumulator_voltage * 0.90f)) {
+                precharge_complete = true;
+            }
+            
+            if (!precharge_complete && (HAL_GetTick() - precharge_start_time > 3000)) {
+                currentState = STATE_FAULT;
+                break;
+            }
+#endif
+
+            if (precharge_complete) {
+                HAL_GPIO_WritePin(PIN_AIR_POS_PORT, PIN_AIR_POS_PIN, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
+                
+                currentState = STATE_TS_ACTIVE;
+            }
+            break;
+        }
+            
+        case STATE_TS_ACTIVE:
         {
 #if DESK_TEST_MODE
             bool start_pressed = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
 #else
             bool start_pressed = (HAL_GPIO_ReadPin(PIN_START_BTN_PORT, PIN_START_BTN_PIN) == GPIO_PIN_SET);
 #endif
-            if (start_pressed && isBrakePressed) {
-                currentState = STATE_PRECHARGE;
-                precharge_start_time = HAL_GetTick();
-                
-                // Fermer AIR- et Precharge Relay
-                HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_SET);
-                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_SET);
+            if (brake_norm > 0.20f && start_pressed) {
+                currentState = STATE_RTDS;
+                rtds_start_time = HAL_GetTick();
+                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_SET);
             }
             break;
         }
-            
-        case STATE_PRECHARGE:
-        {
-            bool precharge_complete = false;
-            
-#if DESK_TEST_MODE
-            // Simulation : on attend 2 secondes pour simuler la montée de tension à 90%
-            if (HAL_GetTick() - precharge_start_time > 2000) {
-                precharge_complete = true;
-            }
-#else
-            // Voiture réelle : Vérifier que la tension inverter >= 90% tension batterie
-            if (inverter_voltage >= (accumulator_voltage * 0.90f)) {
-                precharge_complete = true;
-            }
-            
-            // Timeout de sécurité : si ça prend plus de 3 secondes, on annule tout !
-            if (!precharge_complete && (HAL_GetTick() - precharge_start_time > 3000)) {
-                HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_RESET);
-                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
-                currentState = STATE_OFF; // ERREUR PRECHARGE
-                break;
-            }
-#endif
 
-            if (precharge_complete) {
-                // Tension OK ! On ferme AIR+ et on ouvre Precharge
-                HAL_GPIO_WritePin(PIN_AIR_POS_PORT, PIN_AIR_POS_PIN, GPIO_PIN_SET);
-                HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
-                
-                // Démarrage du RTDS (Buzzer)
-                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_SET);
-                rtds_start_time = HAL_GetTick();
-                rtds_playing = true;
-                
+        case STATE_RTDS:
+        {
+            if (HAL_GetTick() - rtds_start_time > 2000) {
+                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
+                g_inverter_enable = 1;
                 currentState = STATE_READY_TO_DRIVE;
             }
             break;
         }
-            
+
         case STATE_READY_TO_DRIVE:
         {
-            // Eteindre le buzzer après 2 secondes
-            if (rtds_playing && (HAL_GetTick() - rtds_start_time > 2000)) {
-                HAL_GPIO_WritePin(PIN_BUZZER_PORT, PIN_BUZZER_PIN, GPIO_PIN_RESET);
-                rtds_playing = false;
-            }
+            // Les calculs de couple et derating s'appliquent dans la boucle principale
+            break;
+        }
+
+        case STATE_FAULT:
+        {
+            HAL_GPIO_WritePin(PIN_AIR_POS_PORT, PIN_AIR_POS_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(PIN_AIR_NEG_PORT, PIN_AIR_NEG_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(PIN_PRECHARGE_PORT, PIN_PRECHARGE_PIN, GPIO_PIN_RESET);
+            g_inverter_enable = 0;
+            g_torque_demand = 0.0f;
             break;
         }
     }
@@ -658,17 +673,25 @@ int main(void)
         }
 
         /* ── Mettre à jour les variables globales pour le Timer ── */
-        g_torque_demand = torque_demand;
-        g_inverter_enable = (torque_demand > 0 && currentState == STATE_READY_TO_DRIVE) ? 1 : 0;
+        if (currentState == STATE_READY_TO_DRIVE) {
+            g_torque_demand = torque_demand;
+            g_inverter_enable = 1; // L'inverter reste activé dans READY_TO_DRIVE
+        } else {
+            g_torque_demand = 0.0f;
+            g_inverter_enable = 0;
+        }
 
 #if DESK_TEST_MODE
         static uint32_t last_print_time = 0;
         if (HAL_GetTick() - last_print_time > 500) {
             const char* state_str = "UNKNOWN";
             switch(currentState) {
-                case STATE_OFF: state_str = "OFF"; break;
+                case STATE_GLV_ON: state_str = "GLV_ON"; break;
                 case STATE_PRECHARGE: state_str = "PRECHARGE"; break;
+                case STATE_TS_ACTIVE: state_str = "TS_ACTIVE"; break;
+                case STATE_RTDS: state_str = "RTDS"; break;
                 case STATE_READY_TO_DRIVE: state_str = "READY"; break;
+                case STATE_FAULT: state_str = "FAULT"; break;
             }
             printf("State: %s | Brake: %d%% | APPS: %d%% | Light: %s\r\n", 
                 state_str,
