@@ -129,15 +129,9 @@ typedef struct
 /* ── Loop period ── */
 #define LOOP_PERIOD_MS   10u
 
-/* ── GPIO output pins (already configured as outputs in MX_GPIO_Init) ── */
-#define GPIO_OUT1_PORT   GPIOC
-#define GPIO_OUT1_PIN    GPIO_PIN_1
-
-#define GPIO_OUT2_PORT   GPIOC
-#define GPIO_OUT2_PIN    GPIO_PIN_2
-
-#define GPIO_OUT3_PORT   GPIOC
-#define GPIO_OUT3_PIN    GPIO_PIN_3
+/* ── Fault LED ── */
+#define PIN_FAULT_LED_PORT GPIOC
+#define PIN_FAULT_LED_PIN  GPIO_PIN_3
 
 // TODO : put in config file
 #define DRIVE_TEMPERATURES_1_CAN_ID (0x0A0)
@@ -270,9 +264,7 @@ int lin_map (int val, int in_min, int in_max, int out_min, int out_max);
 int limit (int val, int min, int max);
 
 /* ── User GPIO helpers – call these anywhere in the while(1) ── */
-static void GPIO_Out1_Set(GPIO_PinState state);
-static void GPIO_Out2_Set(GPIO_PinState state);
-static void GPIO_Out3_Set(GPIO_PinState state);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -390,31 +382,7 @@ static float Clampf(float v, float lo, float hi)
     return v;
 }
 
-/**
- * @brief  Drive GPIO output 1 (PC1).
- *         Example: GPIO_Out1_Set(GPIO_PIN_SET);   // transistor ON
- *                  GPIO_Out1_Set(GPIO_PIN_RESET);  // transistor OFF
- */
-static void GPIO_Out1_Set(GPIO_PinState state)
-{
-    HAL_GPIO_WritePin(GPIO_OUT1_PORT, GPIO_OUT1_PIN, state);
-}
 
-/**
- * @brief  Drive GPIO output 2 (PC2).
- */
-static void GPIO_Out2_Set(GPIO_PinState state)
-{
-    HAL_GPIO_WritePin(GPIO_OUT2_PORT, GPIO_OUT2_PIN, state);
-}
-
-/**
- * @brief  Drive GPIO output 3 (PC3).
- */
-static void GPIO_Out3_Set(GPIO_PinState state)
-{
-    HAL_GPIO_WritePin(GPIO_OUT3_PORT, GPIO_OUT3_PIN, state);
-}
 
 /**
  * @brief  Read all three ADC channels sequentially.
@@ -594,10 +562,8 @@ int main(void)
     }
     lockout_cleared = true;
 
-    /* ── All three GPIO outputs start LOW (transistors OFF) ── */
-    GPIO_Out1_Set(GPIO_PIN_RESET);
-    GPIO_Out2_Set(GPIO_PIN_RESET);
-    GPIO_Out3_Set(GPIO_PIN_RESET);
+    /* ── Fault LED starts LOW ── */
+    HAL_GPIO_WritePin(PIN_FAULT_LED_PORT, PIN_FAULT_LED_PIN, GPIO_PIN_RESET);
 
     MX_TIM2_Init();
     HAL_TIM_Base_Start_IT(&htim2); /* Démarrage du TIM2 pour la boucle CAN 10 ms */
@@ -679,35 +645,14 @@ int main(void)
         }
 #endif
 
-        /* ================================================================
-         *  GPIO OUTPUT EXAMPLES
-         *  ---------------------
-         *  Put your own conditions below.  The three GPIOs drive NPN
-         *  transistors or optocouplers externally.  Replace the sample
-         *  conditions with whatever logic your application requires.
-         * ================================================================ */
-
-        /* ── GPIO 1 : turn ON when accelerator is pressed > 5 % ── */
-        if (torque_demand > 0.05f)
-        {
-            GPIO_Out1_Set(GPIO_PIN_SET);    /* transistor ON */
-        }
-        else
-        {
-            GPIO_Out1_Set(GPIO_PIN_RESET);  /* transistor OFF */
-        }
-
-        /* ── GPIO 2 : turn ON when brake is actively pressed ── */
-        // Remplacé par updateBrakeLight() qui gère PIN_BRAKE_LIGHT_PIN (PC2) avec un seuil de 10%
-
-        /* ── GPIO 3 : turn ON when APPS mismatch fault OR Inverter Lockout is present ── */
+        /* ── Voyant d'erreur (Fault LED sur PC3) ── */
         if (apps_diff > APPS_MISMATCH_THRESHOLD || inverter_lockout_state == 0)
         {
-            GPIO_Out3_Set(GPIO_PIN_SET);    /* fault indicator */
+            HAL_GPIO_WritePin(PIN_FAULT_LED_PORT, PIN_FAULT_LED_PIN, GPIO_PIN_SET);
         }
         else
         {
-            GPIO_Out3_Set(GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(PIN_FAULT_LED_PORT, PIN_FAULT_LED_PIN, GPIO_PIN_RESET);
         }
 
         /* ── Loop delay : 1 ms pour ne pas étouffer le CPU ── */
