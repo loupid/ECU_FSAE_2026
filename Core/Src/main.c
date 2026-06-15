@@ -121,10 +121,10 @@ typedef struct
 #define CAN_ID_CMD       0x0C0   /* command message  → inverter */
 #define CAN_ID_STATUS    0x0AA   /* internal states ← inverter (optional RX) */
 
-/* ── Torque scaling ── */
-/*   Protocol: torque value = actual_Nm × 10, signed 16-bit, little-endian.
+/* ── Torque limits ───────────────────────────────────────────────────────
  *   Set MAX_TORQUE_NM to your motor's rated motoring torque.             */
 #define MAX_TORQUE_NM    200.0f  /* ← adjust to your motor */
+#define MAX_POWER_W      4410.0f
 
 /* ── Loop period ── */
 #define LOOP_PERIOD_MS   10u
@@ -635,6 +635,17 @@ int main(void)
 
         /* ── 4. Compute final torque demand ── */
         float torque_demand = (apps1_norm + apps2_norm) * 0.5f;
+
+        float target_torque_nm = torque_demand * MAX_TORQUE_NM;
+        float speed_rad_s = (float)g_speed * 0.10472f;
+
+        if (speed_rad_s > 10.0f) { // Au-dessus de ~100 RPM
+            float max_allowed_torque = MAX_POWER_W / speed_rad_s;
+            if (target_torque_nm > max_allowed_torque) {
+                target_torque_nm = max_allowed_torque;
+            }
+        }
+        torque_demand = target_torque_nm / MAX_TORQUE_NM;
 
         /* ── 5. Brake override ──────────────────────────────────────────
          *   If brake pressure exceeds 20 % the torque command is forced
